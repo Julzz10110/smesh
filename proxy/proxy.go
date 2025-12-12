@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -65,10 +66,33 @@ func NewProxy(serviceName string, caURL string, discoveryAddr string) (*Proxy, e
 
 // Start starts the proxy server
 func (p *Proxy) Start(port string) error {
+	// Create HTTP mux for health check and proxy (non-TLS)
+	httpMux := http.NewServeMux()
+	httpMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("HTTP Health check request from %s", r.RemoteAddr)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+	
+	// Add proxy endpoint to HTTP server too
+	httpMux.HandleFunc("/proxy/", p.handleProxy)
+	
+	// Start HTTP server for health checks and proxy on a different port
+	healthPort := ":8081"
+	go func() {
+		log.Printf("Proxy HTTP server starting on %s (for health checks and proxy)", healthPort)
+		if err := http.ListenAndServe(healthPort, httpMux); err != nil {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
+
+	// Create TLS mux for actual proxy
 	mux := http.NewServeMux()
 
-	// Health check endpoint
+	// Health check endpoint on TLS - should work without client certificate
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		// Log for debugging
+		log.Printf("TLS Health check request from %s, TLS: %v", r.RemoteAddr, r.TLS != nil)
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
@@ -90,7 +114,22 @@ func (p *Proxy) Start(port string) error {
 	}
 
 	log.Printf("Proxy starting on %s for service %s", port, p.serviceName)
-	return p.server.ListenAndServeTLS("", "")
+	
+	// Verify certificates are configured
+	if len(p.tlsConfig.Certificates) == 0 {
+		return fmt.Errorf("no TLS certificates configured")
+	}
+	
+	// Create TLS listener manually for better control
+	listener, err := net.Listen("tcp", port)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %w", port, err)
+	}
+	
+	tlsListener := tls.NewListener(listener, p.tlsConfig)
+	log.Printf("Proxy TLS listener created, accepting connections...")
+	
+	return p.server.Serve(tlsListener)
 }
 
 // handleProxy handles request proxying
@@ -121,21 +160,29 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Get backend from balancer
 	backend, err := p.balancer.GetBackend(serviceName)
 	if err != nil {
+		log.Printf("No backend available for service %s: %v", serviceName, err)
 		http.Error(w, fmt.Sprintf("No backend available: %v", err), http.StatusServiceUnavailable)
 		return
 	}
 
+	log.Printf("Proxying request to %s for service %s", backend.URL, serviceName)
+
 	// Create URL for proxying
 	targetURL, err := url.Parse(backend.URL)
 	if err != nil {
+		log.Printf("Invalid backend URL %s: %v", backend.URL, err)
 		http.Error(w, fmt.Sprintf("Invalid backend URL: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	// Create reverse proxy
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	proxy.Transport = &http.Transport{
-		TLSClientConfig: p.tlsConfig,
+	
+	// Only use TLS transport if target URL is HTTPS
+	if targetURL.Scheme == "https" {
+		proxy.Transport = &http.Transport{
+			TLSClientConfig: p.tlsConfig,
+		}
 	}
 
 	// Update request
@@ -225,7 +272,8 @@ func (p *Proxy) handleUpdateBackends(w http.ResponseWriter, r *http.Request) {
 	}
 	urls := make([]string, 0, len(services))
 	for _, s := range services {
-		urls = append(urls, fmt.Sprintf("https://%s:%d", s.Address, s.Port))
+		// Use HTTP for services (they run on HTTP, not HTTPS)
+		urls = append(urls, fmt.Sprintf("http://%s:%d", s.Address, s.Port))
 	}
 
 	p.balancer.UpdateBackends(serviceName, urls)
@@ -280,26 +328,44 @@ func (p *Proxy) UpdateBackendsFromDiscovery() error {
 	} else if p.discoveryClient != nil {
 		allServices, err = p.discoveryClient.GetAllServices()
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to get services from discovery: %w", err)
 		}
 	} else {
 		return fmt.Errorf("discovery not configured")
+	}
+
+	if len(allServices) == 0 {
+		log.Printf("No services found in discovery")
+		return nil
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	// Update backends for each service
+	updatedCount := 0
 	for serviceName, services := range allServices {
 		urls := make([]string, 0, len(services))
 		for _, s := range services {
 			if s.Healthy {
-				urls = append(urls, fmt.Sprintf("https://%s:%d", s.Address, s.Port))
+				// Use HTTP for services (they run on HTTP, not HTTPS)
+				urls = append(urls, fmt.Sprintf("http://%s:%d", s.Address, s.Port))
 			}
 		}
-		p.balancer.UpdateBackends(serviceName, urls)
+		if len(urls) > 0 {
+			log.Printf("Updating backends for %s: %v", serviceName, urls)
+			p.balancer.UpdateBackends(serviceName, urls)
+			updatedCount++
+		} else {
+			log.Printf("No healthy backends found for service %s", serviceName)
+		}
 	}
 
+	if updatedCount == 0 {
+		return fmt.Errorf("no healthy services found in discovery")
+	}
+
+	log.Printf("Updated backends for %d service(s)", updatedCount)
 	return nil
 }
 

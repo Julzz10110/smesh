@@ -23,6 +23,15 @@ func main() {
 	// Start backend updates from discovery
 	p.StartDiscoveryUpdater(30 * time.Second)
 
+	// Do initial backend update immediately
+	log.Printf("Performing initial backend update from discovery...")
+	if err := p.UpdateBackendsFromDiscovery(); err != nil {
+		log.Printf("Warning: Failed to update backends initially: %v", err)
+		log.Printf("Backends will be updated automatically every 30 seconds")
+	} else {
+		log.Printf("Initial backend update completed")
+	}
+
 	log.Printf("Proxy starting for service %s on %s", *serviceName, *port)
 	if err := p.Start(*port); err != nil {
 		log.Fatalf("Failed to start proxy: %v", err)

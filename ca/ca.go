@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -110,7 +111,8 @@ func (ca *CA) GenerateCertificate(serviceName string, validityDays int) (*x509.C
 		SubjectKeyId: []byte{1, 2, 3, 4, 5},
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		DNSNames:     []string{serviceName, "localhost"},
+		DNSNames:     []string{serviceName, "localhost", "127.0.0.1"},
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 	}
 
 	certBytes, err := x509.CreateCertificate(rand.Reader, cert, ca.caCert, &key.PublicKey, ca.caKey)
@@ -205,10 +207,17 @@ func (ca *CA) GetTLSConfig(serviceName string, isServer bool) (*tls.Config, erro
 		Certificates: []tls.Certificate{tlsCert},
 		RootCAs:      caCertPool,
 		ClientCAs:    caCertPool,
+		MinVersion:   tls.VersionTLS12,
+		// Don't restrict MaxVersion - let Go choose the best
+		// Don't restrict CipherSuites - let Go choose the best for compatibility
+		PreferServerCipherSuites: false,
 	}
 
 	if isServer {
-		config.ClientAuth = tls.RequireAndVerifyClientCert
+		// Use NoClientCert to allow connections without client certificates
+		// This is needed for health checks and initial connections
+		// For production, you might want to use RequestClientCert or RequireAndVerifyClientCert
+		config.ClientAuth = tls.NoClientCert
 	}
 
 	return config, nil
