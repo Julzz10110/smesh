@@ -32,7 +32,8 @@ type Proxy struct {
 func NewProxy(serviceName string, caURL string, discoveryAddr string) (*Proxy, error) {
 	// Initialize CA client (simplified version - in reality HTTP client is needed)
 	// For demonstration, create local CA
-	certAuthority, err := ca.NewCA()
+	// Use empty string for in-memory mode (proxy doesn't need persistence)
+	certAuthority, err := ca.NewCA("")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create CA: %w", err)
 	}
