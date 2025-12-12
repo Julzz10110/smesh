@@ -3,6 +3,9 @@ package main
 import (
 	"flag"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"smesh/proxy"
@@ -32,8 +35,25 @@ func main() {
 		log.Printf("Initial backend update completed")
 	}
 
-	log.Printf("Proxy starting for service %s on %s", *serviceName, *port)
-	if err := p.Start(*port); err != nil {
-		log.Fatalf("Failed to start proxy: %v", err)
+	// Setup graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	// Start proxy in goroutine
+	go func() {
+		log.Printf("Proxy starting for service %s on %s", *serviceName, *port)
+		if err := p.Start(*port); err != nil {
+			log.Printf("Proxy server error: %v", err)
+		}
+	}()
+
+	// Wait for interrupt signal
+	<-sigChan
+	log.Println("Shutting down Proxy server...")
+
+	if err := p.Shutdown(); err != nil {
+		log.Printf("Error during shutdown: %v", err)
+	} else {
+		log.Println("Proxy server stopped gracefully")
 	}
 }

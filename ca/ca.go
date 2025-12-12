@@ -1,6 +1,7 @@
 package ca
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -27,6 +28,7 @@ type CA struct {
 	certStore map[string]*CertInfo
 	db        *bolt.DB
 	dbPath    string
+	server    *http.Server
 	mu        sync.RWMutex
 }
 
@@ -551,10 +553,22 @@ func (ca *CA) StartHTTPServer(port string) error {
 		w.Write([]byte("Certificate rotated"))
 	})
 
-	server := &http.Server{
+	ca.server = &http.Server{
 		Addr:    port,
 		Handler: mux,
 	}
 
-	return server.ListenAndServe()
+	return ca.server.ListenAndServe()
+}
+
+// Shutdown gracefully shuts down the CA server
+func (ca *CA) Shutdown() error {
+	if ca.server != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := ca.server.Shutdown(ctx); err != nil {
+			return fmt.Errorf("failed to shutdown HTTP server: %w", err)
+		}
+	}
+	return nil
 }

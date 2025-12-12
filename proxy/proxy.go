@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"log"
@@ -25,6 +26,7 @@ type Proxy struct {
 	balancer        *balancer.Balancer
 	tlsConfig       *tls.Config
 	server          *http.Server
+	httpServer      *http.Server
 	mu              sync.RWMutex
 }
 
@@ -80,9 +82,13 @@ func (p *Proxy) Start(port string) error {
 	
 	// Start HTTP server for health checks and proxy on a different port
 	healthPort := ":8081"
+	p.httpServer = &http.Server{
+		Addr:    healthPort,
+		Handler: httpMux,
+	}
 	go func() {
 		log.Printf("Proxy HTTP server starting on %s (for health checks and proxy)", healthPort)
-		if err := http.ListenAndServe(healthPort, httpMux); err != nil {
+		if err := p.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("HTTP server error: %v", err)
 		}
 	}()
@@ -131,6 +137,42 @@ func (p *Proxy) Start(port string) error {
 	log.Printf("Proxy TLS listener created, accepting connections...")
 	
 	return p.server.Serve(tlsListener)
+}
+
+// Shutdown gracefully shuts down the proxy server
+func (p *Proxy) Shutdown() error {
+	var errs []error
+	
+	// Shutdown TLS server
+	if p.server != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := p.server.Shutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("failed to shutdown TLS server: %w", err))
+		}
+	}
+	
+	// Shutdown HTTP server
+	if p.httpServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := p.httpServer.Shutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("failed to shutdown HTTP server: %w", err))
+		}
+	}
+	
+	// Close CA
+	if p.ca != nil {
+		if err := p.ca.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close CA: %w", err))
+		}
+	}
+	
+	if len(errs) > 0 {
+		return fmt.Errorf("shutdown errors: %v", errs)
+	}
+	
+	return nil
 }
 
 // handleProxy handles request proxying

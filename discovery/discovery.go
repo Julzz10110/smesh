@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,6 +29,7 @@ type ServiceInfo struct {
 type Discovery struct {
 	raft      *raft.Raft
 	services  map[string][]*ServiceInfo
+	server    *http.Server
 	mu        sync.RWMutex
 	transport *raft.NetworkTransport
 }
@@ -484,11 +486,32 @@ func (d *Discovery) StartHTTPServer(port string) error {
 		}
 	})
 
-	server := &http.Server{
+	d.server = &http.Server{
 		Addr:    port,
 		Handler: mux,
 	}
 
 	log.Printf("Discovery HTTP server starting on %s", port)
-	return server.ListenAndServe()
+	return d.server.ListenAndServe()
+}
+
+// Shutdown gracefully shuts down the Discovery server
+func (d *Discovery) Shutdown() error {
+	if d.server != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := d.server.Shutdown(ctx); err != nil {
+			return fmt.Errorf("failed to shutdown HTTP server: %w", err)
+		}
+	}
+
+	// Shutdown Raft
+	if d.raft != nil {
+		future := d.raft.Shutdown()
+		if err := future.Error(); err != nil {
+			return fmt.Errorf("failed to shutdown Raft: %w", err)
+		}
+	}
+
+	return nil
 }

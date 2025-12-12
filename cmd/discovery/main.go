@@ -4,6 +4,8 @@ import (
 	"flag"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"smesh/discovery"
 )
@@ -42,9 +44,25 @@ func main() {
 		}
 	}
 
-	// Start HTTP server
-	log.Printf("Discovery HTTP server starting on %s", *httpPort)
-	if err := d.StartHTTPServer(*httpPort); err != nil {
-		log.Fatalf("Failed to start HTTP server: %v", err)
+	// Setup graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	// Start HTTP server in goroutine
+	go func() {
+		log.Printf("Discovery HTTP server starting on %s", *httpPort)
+		if err := d.StartHTTPServer(*httpPort); err != nil {
+			log.Printf("Discovery server error: %v", err)
+		}
+	}()
+
+	// Wait for interrupt signal
+	<-sigChan
+	log.Println("Shutting down Discovery server...")
+
+	if err := d.Shutdown(); err != nil {
+		log.Printf("Error during shutdown: %v", err)
+	} else {
+		log.Println("Discovery server stopped gracefully")
 	}
 }
