@@ -13,6 +13,8 @@ import (
 
 	"github.com/hashicorp/raft"
 	boltstore "github.com/hashicorp/raft-boltdb"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // ServiceInfo contains service information
@@ -25,6 +27,60 @@ type ServiceInfo struct {
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
+var (
+	// Metrics for Discovery
+	discoveryServicesCount = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "discovery_services_count",
+			Help: "Current number of registered services",
+		},
+	)
+	discoveryServiceInstancesCount = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "discovery_service_instances_count",
+			Help: "Current number of service instances",
+		},
+	)
+	discoveryOperationsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "discovery_operations_total",
+			Help: "Total number of discovery operations",
+		},
+		[]string{"operation"},
+	)
+	discoveryHTTPRequests = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "discovery_http_requests_total",
+			Help: "Total number of HTTP requests",
+		},
+		[]string{"method", "endpoint", "status"},
+	)
+	discoveryHTTPRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "discovery_http_request_duration_seconds",
+			Help:    "HTTP request duration in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "endpoint"},
+	)
+	discoveryRaftState = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "discovery_raft_state",
+			Help: "Raft node state (1=leader, 0=otherwise)",
+		},
+		[]string{"node_id"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(discoveryServicesCount)
+	prometheus.MustRegister(discoveryServiceInstancesCount)
+	prometheus.MustRegister(discoveryOperationsTotal)
+	prometheus.MustRegister(discoveryHTTPRequests)
+	prometheus.MustRegister(discoveryHTTPRequestDuration)
+	prometheus.MustRegister(discoveryRaftState)
+}
+
 // Discovery manages service discovery via Raft
 type Discovery struct {
 	raft      *raft.Raft
@@ -32,6 +88,7 @@ type Discovery struct {
 	server    *http.Server
 	mu        sync.RWMutex
 	transport *raft.NetworkTransport
+	nodeID    string
 }
 
 // NewDiscovery creates a new Discovery with Raft
@@ -102,6 +159,7 @@ func NewDiscovery(nodeID, bindAddr, raftDir string) (*Discovery, error) {
 		raft:      r,
 		services:  make(map[string][]*ServiceInfo),
 		transport: transport,
+		nodeID:    nodeID,
 	}
 
 	// Save reference to FSM for data access
@@ -154,6 +212,9 @@ func (d *Discovery) Register(service *ServiceInfo) error {
 	}
 
 	f := d.raft.Apply(data, 10*time.Second)
+	if f.Error() == nil {
+		discoveryOperationsTotal.WithLabelValues("register").Inc()
+	}
 	return f.Error()
 }
 
@@ -176,6 +237,9 @@ func (d *Discovery) Deregister(serviceName, address string) error {
 	}
 
 	f := d.raft.Apply(data, 10*time.Second)
+	if f.Error() == nil {
+		discoveryOperationsTotal.WithLabelValues("deregister").Inc()
+	}
 	return f.Error()
 }
 
@@ -199,7 +263,33 @@ func (d *Discovery) UpdateHealth(serviceName, address string, healthy bool) erro
 	}
 
 	f := d.raft.Apply(data, 10*time.Second)
+	if f.Error() == nil {
+		discoveryOperationsTotal.WithLabelValues("update_health").Inc()
+	}
 	return f.Error()
+}
+
+// updateMetrics updates service count metrics
+func (d *Discovery) updateMetrics() {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	
+	discoveryServicesCount.Set(float64(len(d.services)))
+	totalInstances := 0
+	for _, instances := range d.services {
+		totalInstances += len(instances)
+	}
+	discoveryServiceInstancesCount.Set(float64(totalInstances))
+
+	// Update Raft state
+	if d.raft != nil {
+		isLeader := d.raft.State() == raft.Leader
+		if isLeader {
+			discoveryRaftState.WithLabelValues(d.nodeID).Set(1)
+		} else {
+			discoveryRaftState.WithLabelValues(d.nodeID).Set(0)
+		}
+	}
 }
 
 // GetServices returns list of services by name
@@ -390,12 +480,61 @@ func (s *discoverySnapshot) Persist(sink raft.SnapshotSink) error {
 // Release releases resources
 func (s *discoverySnapshot) Release() {}
 
+// responseWriter wraps http.ResponseWriter to capture status code
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+// metricsUpdater periodically updates metrics
+func (d *Discovery) metricsUpdater() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		d.updateMetrics()
+	}
+}
+
 // StartHTTPServer starts HTTP API for discovery
 func (d *Discovery) StartHTTPServer(port string) error {
 	mux := http.NewServeMux()
 
+	// Metrics endpoint
+	mux.Handle("/metrics", promhttp.Handler())
+
+	// Middleware for metrics
+	metricsMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			endpoint := r.URL.Path
+
+			// Create a response writer wrapper to capture status code
+			wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+			next.ServeHTTP(wrapped, r)
+
+			duration := time.Since(start).Seconds()
+			status := http.StatusText(wrapped.statusCode)
+			if status == "" {
+				status = fmt.Sprintf("%d", wrapped.statusCode)
+			}
+
+			discoveryHTTPRequests.WithLabelValues(r.Method, endpoint, fmt.Sprintf("%d", wrapped.statusCode)).Inc()
+			discoveryHTTPRequestDuration.WithLabelValues(r.Method, endpoint).Observe(duration)
+			
+			// Update service count metrics
+			d.updateMetrics()
+		}
+	}
+
 	// Service registration
-	mux.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/register", metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -414,10 +553,10 @@ func (d *Discovery) StartHTTPServer(port string) error {
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "registered"})
-	})
+	}))
 
 	// Service removal
-	mux.HandleFunc("/deregister", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/deregister", metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -440,10 +579,10 @@ func (d *Discovery) StartHTTPServer(port string) error {
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "deregistered"})
-	})
+	}))
 
 	// Health update
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/health", metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -467,10 +606,10 @@ func (d *Discovery) StartHTTPServer(port string) error {
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
-	})
+	}))
 
 	// Get services
-	mux.HandleFunc("/services", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/services", metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -484,7 +623,10 @@ func (d *Discovery) StartHTTPServer(port string) error {
 			allServices := d.GetAllServices()
 			json.NewEncoder(w).Encode(allServices)
 		}
-	})
+	}))
+
+	// Start metrics updater
+	go d.metricsUpdater()
 
 	d.server = &http.Server{
 		Addr:    port,

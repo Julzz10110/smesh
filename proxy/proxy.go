@@ -15,7 +15,66 @@ import (
 	"smesh/balancer"
 	"smesh/ca"
 	"smesh/discovery"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+var (
+	// Metrics for Proxy
+	proxyRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "proxy_requests_total",
+			Help: "Total number of proxied requests",
+		},
+		[]string{"service", "status"},
+	)
+	proxyRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "proxy_request_duration_seconds",
+			Help:    "Request duration in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"service"},
+	)
+	proxyBackendsCount = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "proxy_backends_count",
+			Help: "Current number of backends per service",
+		},
+		[]string{"service"},
+	)
+	proxyBackendsHealthyCount = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "proxy_backends_healthy_count",
+			Help: "Current number of healthy backends per service",
+		},
+		[]string{"service"},
+	)
+	proxyHTTPRequests = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "proxy_http_requests_total",
+			Help: "Total number of HTTP requests to proxy",
+		},
+		[]string{"method", "endpoint", "status"},
+	)
+	proxyHTTPRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "proxy_http_request_duration_seconds",
+			Help:    "HTTP request duration in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "endpoint"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(proxyRequestsTotal)
+	prometheus.MustRegister(proxyRequestDuration)
+	prometheus.MustRegister(proxyBackendsCount)
+	prometheus.MustRegister(proxyBackendsHealthyCount)
+	prometheus.MustRegister(proxyHTTPRequests)
+	prometheus.MustRegister(proxyHTTPRequestDuration)
+}
 
 // Proxy represents sidecar proxy
 type Proxy struct {
@@ -71,11 +130,31 @@ func NewProxy(serviceName string, caURL string, discoveryAddr string) (*Proxy, e
 func (p *Proxy) Start(port string) error {
 	// Create HTTP mux for health check and proxy (non-TLS)
 	httpMux := http.NewServeMux()
-	httpMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	
+	// Metrics endpoint
+	httpMux.Handle("/metrics", promhttp.Handler())
+	
+	// Middleware for HTTP metrics
+	httpMetricsMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			endpoint := r.URL.Path
+			
+			wrapped := &proxyResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+			next.ServeHTTP(wrapped, r)
+			
+			duration := time.Since(start).Seconds()
+			statusCode := fmt.Sprintf("%d", wrapped.statusCode)
+			proxyHTTPRequests.WithLabelValues(r.Method, endpoint, statusCode).Inc()
+			proxyHTTPRequestDuration.WithLabelValues(r.Method, endpoint).Observe(duration)
+		}
+	}
+	
+	httpMux.HandleFunc("/health", httpMetricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("HTTP Health check request from %s", r.RemoteAddr)
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
-	})
+	}))
 	
 	// Add proxy endpoint to HTTP server too
 	httpMux.HandleFunc("/proxy/", p.handleProxy)
@@ -96,22 +175,41 @@ func (p *Proxy) Start(port string) error {
 	// Create TLS mux for actual proxy
 	mux := http.NewServeMux()
 
+	// Metrics endpoint
+	mux.Handle("/metrics", promhttp.Handler())
+
+	// Middleware for TLS metrics
+	tlsMetricsMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			endpoint := r.URL.Path
+			
+			wrapped := &proxyResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+			next.ServeHTTP(wrapped, r)
+			
+			duration := time.Since(start).Seconds()
+			statusCode := fmt.Sprintf("%d", wrapped.statusCode)
+			proxyHTTPRequests.WithLabelValues(r.Method, endpoint, statusCode).Inc()
+			proxyHTTPRequestDuration.WithLabelValues(r.Method, endpoint).Observe(duration)
+		}
+	}
+
 	// Health check endpoint on TLS - should work without client certificate
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/health", tlsMetricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// Log for debugging
 		log.Printf("TLS Health check request from %s, TLS: %v", r.RemoteAddr, r.TLS != nil)
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
-	})
+	}))
 
 	// Proxy endpoint - proxies requests to other services
 	mux.HandleFunc("/proxy/", p.handleProxy)
 
 	// Service discovery endpoint - registers service
-	mux.HandleFunc("/register", p.handleRegister)
+	mux.HandleFunc("/register", tlsMetricsMiddleware(p.handleRegister))
 
 	// Update backends from discovery
-	mux.HandleFunc("/update-backends", p.handleUpdateBackends)
+	mux.HandleFunc("/update-backends", tlsMetricsMiddleware(p.handleUpdateBackends))
 
 	// Create HTTP server with TLS
 	p.server = &http.Server{
@@ -177,10 +275,13 @@ func (p *Proxy) Shutdown() error {
 
 // handleProxy handles request proxying
 func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	
 	// Extract target service name from path
 	// Format: /proxy/service-name/path
 	path := r.URL.Path[len("/proxy/"):]
 	if path == "" {
+		proxyHTTPRequests.WithLabelValues(r.Method, "/proxy/", "400").Inc()
 		http.Error(w, "Service name required", http.StatusBadRequest)
 		return
 	}
@@ -204,6 +305,9 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 	backend, err := p.balancer.GetBackend(serviceName)
 	if err != nil {
 		log.Printf("No backend available for service %s: %v", serviceName, err)
+		proxyRequestsTotal.WithLabelValues(serviceName, "503").Inc()
+		proxyRequestDuration.WithLabelValues(serviceName).Observe(time.Since(start).Seconds())
+		proxyHTTPRequests.WithLabelValues(r.Method, "/proxy/", "503").Inc()
 		http.Error(w, fmt.Sprintf("No backend available: %v", err), http.StatusServiceUnavailable)
 		return
 	}
@@ -221,6 +325,9 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Create reverse proxy
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 	
+	// Wrap response writer to capture status code
+	wrapped := &proxyResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+	
 	// Only use TLS transport if target URL is HTTPS
 	if targetURL.Scheme == "https" {
 		proxy.Transport = &http.Transport{
@@ -235,7 +342,15 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 	r.Host = targetURL.Host
 
 	// Proxy request
-	proxy.ServeHTTP(w, r)
+	proxy.ServeHTTP(wrapped, r)
+	
+	// Update metrics
+	duration := time.Since(start).Seconds()
+	statusCode := fmt.Sprintf("%d", wrapped.statusCode)
+	proxyRequestsTotal.WithLabelValues(serviceName, statusCode).Inc()
+	proxyRequestDuration.WithLabelValues(serviceName).Observe(duration)
+	proxyHTTPRequests.WithLabelValues(r.Method, "/proxy/", statusCode).Inc()
+	proxyHTTPRequestDuration.WithLabelValues(r.Method, "/proxy/").Observe(duration)
 }
 
 // handleRegister registers service in discovery
@@ -320,6 +435,22 @@ func (p *Proxy) handleUpdateBackends(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.balancer.UpdateBackends(serviceName, urls)
+	
+	// Get backend count for metrics (we need to check balancer or discovery)
+	var backendCount, healthyCount float64
+	if p.discovery != nil {
+		services := p.discovery.GetServices(serviceName)
+		backendCount = float64(len(services))
+		healthyCount = float64(len(services)) // GetServices already filters healthy
+	} else if p.discoveryClient != nil {
+		services, err := p.discoveryClient.GetServices(serviceName)
+		if err == nil {
+			backendCount = float64(len(services))
+			healthyCount = float64(len(services))
+		}
+	}
+	proxyBackendsCount.WithLabelValues(serviceName).Set(backendCount)
+	proxyBackendsHealthyCount.WithLabelValues(serviceName).Set(healthyCount)
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Backends updated"))
@@ -339,6 +470,17 @@ func parsePort(s string) int {
 func DirectProxy(targetURL string, tlsConfig *tls.Config) http.Handler {
 	target, _ := url.Parse(targetURL)
 	return httputil.NewSingleHostReverseProxy(target)
+}
+
+// proxyResponseWriter wraps http.ResponseWriter to capture status code
+type proxyResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *proxyResponseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
 }
 
 // ProxyRequest proxies a single request
@@ -385,12 +527,16 @@ func (p *Proxy) UpdateBackendsFromDiscovery() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Update backends for each service
+		// Update backends for each service
 	updatedCount := 0
 	for serviceName, services := range allServices {
 		urls := make([]string, 0, len(services))
+		
+		// Count healthy services
+		healthyCount := 0
 		for _, s := range services {
 			if s.Healthy {
+				healthyCount++
 				// Use HTTP for services (they run on HTTP, not HTTPS)
 				urls = append(urls, fmt.Sprintf("http://%s:%d", s.Address, s.Port))
 			}
@@ -402,6 +548,10 @@ func (p *Proxy) UpdateBackendsFromDiscovery() error {
 		} else {
 			log.Printf("No healthy backends found for service %s", serviceName)
 		}
+		
+		// Update backend metrics
+		proxyBackendsCount.WithLabelValues(serviceName).Set(float64(len(services)))
+		proxyBackendsHealthyCount.WithLabelValues(serviceName).Set(float64(healthyCount))
 	}
 
 	if updatedCount == 0 {

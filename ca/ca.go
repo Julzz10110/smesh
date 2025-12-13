@@ -19,7 +19,56 @@ import (
 	"time"
 
 	"github.com/boltdb/bolt"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+var (
+	// Metrics for CA
+	caCertificatesGenerated = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ca_certificates_generated_total",
+			Help: "Total number of certificates generated",
+		},
+		[]string{"service"},
+	)
+	caCertificateRotations = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ca_certificate_rotations_total",
+			Help: "Total number of certificate rotations",
+		},
+		[]string{"service"},
+	)
+	caHTTPRequests = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ca_http_requests_total",
+			Help: "Total number of HTTP requests",
+		},
+		[]string{"method", "endpoint", "status"},
+	)
+	caHTTPRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "ca_http_request_duration_seconds",
+			Help:    "HTTP request duration in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "endpoint"},
+	)
+	caCertificatesCount = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "ca_certificates_count",
+			Help: "Current number of certificates stored",
+		},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(caCertificatesGenerated)
+	prometheus.MustRegister(caCertificateRotations)
+	prometheus.MustRegister(caHTTPRequests)
+	prometheus.MustRegister(caHTTPRequestDuration)
+	prometheus.MustRegister(caCertificatesCount)
+}
 
 // CA represents Certificate Authority
 type CA struct {
@@ -274,10 +323,13 @@ func (ca *CA) loadCertificates() error {
 				Serial:    serial,
 			}
 
-			ca.certStore[string(serviceName)] = certInfo
-			return nil
-		})
+		ca.certStore[string(serviceName)] = certInfo
+		return nil
 	})
+	})
+	// Update metrics after loading
+	caCertificatesCount.Set(float64(len(ca.certStore)))
+	return nil
 }
 
 // GenerateCertificate generates a new certificate for a service
@@ -334,6 +386,10 @@ func (ca *CA) GenerateCertificate(serviceName string, validityDays int) (*x509.C
 		Serial:    serial,
 	}
 	ca.certStore[serviceName] = certInfo
+
+	// Update metrics
+	caCertificatesGenerated.WithLabelValues(serviceName).Inc()
+	caCertificatesCount.Set(float64(len(ca.certStore)))
 
 	// Save to database if available
 	if ca.db != nil {
@@ -420,6 +476,9 @@ func (ca *CA) GetCertificatePEM(serviceName string) ([]byte, []byte, error) {
 // RotateCertificate forcibly rotates the certificate
 func (ca *CA) RotateCertificate(serviceName string) error {
 	_, _, err := ca.GenerateCertificate(serviceName, 30)
+	if err == nil {
+		caCertificateRotations.WithLabelValues(serviceName).Inc()
+	}
 	return err
 }
 
@@ -462,8 +521,33 @@ func (ca *CA) GetTLSConfig(serviceName string, isServer bool) (*tls.Config, erro
 func (ca *CA) StartHTTPServer(port string) error {
 	mux := http.NewServeMux()
 
+	// Metrics endpoint
+	mux.Handle("/metrics", promhttp.Handler())
+
+	// Middleware for metrics
+	metricsMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			endpoint := r.URL.Path
+
+			// Create a response writer wrapper to capture status code
+			wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+			next.ServeHTTP(wrapped, r)
+
+			duration := time.Since(start).Seconds()
+			status := http.StatusText(wrapped.statusCode)
+			if status == "" {
+				status = fmt.Sprintf("%d", wrapped.statusCode)
+			}
+
+			caHTTPRequests.WithLabelValues(r.Method, endpoint, fmt.Sprintf("%d", wrapped.statusCode)).Inc()
+			caHTTPRequestDuration.WithLabelValues(r.Method, endpoint).Observe(duration)
+		}
+	}
+
 	// Get CA certificate
-	mux.HandleFunc("/ca/cert", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/ca/cert", metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -477,10 +561,10 @@ func (ca *CA) StartHTTPServer(port string) error {
 
 		w.Header().Set("Content-Type", "application/x-pem-file")
 		w.Write(caCertPEM)
-	})
+	}))
 
 	// Get certificate for service
-	mux.HandleFunc("/cert/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/cert/", metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -505,10 +589,10 @@ func (ca *CA) StartHTTPServer(port string) error {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
-	})
+	}))
 
 	// Generate new certificate
-	mux.HandleFunc("/cert/generate", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/cert/generate", metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -528,10 +612,10 @@ func (ca *CA) StartHTTPServer(port string) error {
 
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Certificate generated"))
-	})
+	}))
 
 	// Certificate rotation
-	mux.HandleFunc("/cert/rotate", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/cert/rotate", metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -551,7 +635,7 @@ func (ca *CA) StartHTTPServer(port string) error {
 
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Certificate rotated"))
-	})
+	}))
 
 	ca.server = &http.Server{
 		Addr:    port,
@@ -559,6 +643,17 @@ func (ca *CA) StartHTTPServer(port string) error {
 	}
 
 	return ca.server.ListenAndServe()
+}
+
+// responseWriter wraps http.ResponseWriter to capture status code
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
 }
 
 // Shutdown gracefully shuts down the CA server
