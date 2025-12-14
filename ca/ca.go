@@ -508,10 +508,8 @@ func (ca *CA) GetTLSConfig(serviceName string, isServer bool) (*tls.Config, erro
 	}
 
 	if isServer {
-		// Use NoClientCert to allow connections without client certificates
-		// This is needed for health checks and initial connections
-		// For production, you might want to use RequestClientCert or RequireAndVerifyClientCert
-		config.ClientAuth = tls.NoClientCert
+		// Require and verify client certificates for proper mTLS
+		config.ClientAuth = tls.RequireAndVerifyClientCert
 	}
 
 	return config, nil
@@ -635,6 +633,43 @@ func (ca *CA) StartHTTPServer(port string) error {
 
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Certificate rotated"))
+	}))
+
+	// Auto-generate certificate endpoint (for service bootstrap)
+	// This endpoint allows services to automatically get their certificates
+	mux.HandleFunc("/cert/auto/", metricsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		serviceName := r.URL.Path[len("/cert/auto/"):]
+		if serviceName == "" {
+			http.Error(w, "Service name required", http.StatusBadRequest)
+			return
+		}
+
+		// Auto-generate certificate if it doesn't exist
+		_, _, err := ca.GenerateCertificate(serviceName, 30)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Return certificate in PEM format
+		certPEM, keyPEM, err := ca.GetCertificatePEM(serviceName)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		response := map[string]string{
+			"cert": string(certPEM),
+			"key":  string(keyPEM),
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
 	}))
 
 	ca.server = &http.Server{

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -8,24 +9,37 @@ import (
 	"os"
 	"time"
 
+	"smesh/ca"
 	"smesh/discovery"
 )
 
-// SimpleService represents a simple HTTP service
+// SimpleService represents a simple HTTP service with mTLS
 type SimpleService struct {
-	name    string
-	port    string
-	disco   *discovery.Client
-	healthy bool
+	name      string
+	port      string
+	disco     *discovery.Client
+	caClient  *ca.Client
+	healthy   bool
+	tlsConfig *tls.Config
 }
 
-func NewSimpleService(name, port, discoveryAddr string) *SimpleService {
-	return &SimpleService{
-		name:    name,
-		port:    port,
-		disco:   discovery.NewClient(discoveryAddr),
-		healthy: true,
+func NewSimpleService(name, port, discoveryAddr, caURL string) (*SimpleService, error) {
+	service := &SimpleService{
+		name:     name,
+		port:     port,
+		disco:    discovery.NewClient(discoveryAddr),
+		caClient: ca.NewClient(caURL),
+		healthy:  true,
 	}
+
+	// Get TLS configuration from CA (server config with mTLS)
+	tlsConfig, err := service.caClient.GetTLSConfig(name, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get TLS config: %w", err)
+	}
+	service.tlsConfig = tlsConfig
+
+	return service, nil
 }
 
 func (s *SimpleService) Start() error {
@@ -58,8 +72,15 @@ func (s *SimpleService) Start() error {
 	// Periodically update health status
 	go s.updateHealth()
 
-	log.Printf("Service %s starting on port %s", s.name, s.port)
-	return http.ListenAndServe(":"+s.port, mux)
+	server := &http.Server{
+		Addr:      ":" + s.port,
+		Handler:   mux,
+		TLSConfig: s.tlsConfig,
+	}
+
+	log.Printf("Service %s starting on port %s with mTLS", s.name, s.port)
+	// Start TLS server with mTLS (client certificates required)
+	return server.ListenAndServeTLS("", "")
 }
 
 func (s *SimpleService) register() {
@@ -100,7 +121,7 @@ func parsePort(s string) int {
 
 func main() {
 	if len(os.Args) < 3 {
-		fmt.Println("Usage: simple_service <name> <port> [discovery_addr]")
+		fmt.Println("Usage: simple_service <name> <port> [discovery_addr] [ca_url]")
 		os.Exit(1)
 	}
 
@@ -110,8 +131,16 @@ func main() {
 	if len(os.Args) > 3 {
 		discoveryAddr = os.Args[3]
 	}
+	caURL := "http://localhost:8443"
+	if len(os.Args) > 4 {
+		caURL = os.Args[4]
+	}
 
-	service := NewSimpleService(name, port, discoveryAddr)
+	service, err := NewSimpleService(name, port, discoveryAddr, caURL)
+	if err != nil {
+		log.Fatalf("Failed to create service: %v", err)
+	}
+
 	if err := service.Start(); err != nil {
 		log.Fatalf("Failed to start service: %v", err)
 	}

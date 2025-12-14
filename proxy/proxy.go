@@ -83,7 +83,8 @@ type Proxy struct {
 	discovery       *discovery.Discovery
 	discoveryClient *discovery.Client
 	balancer        *balancer.Balancer
-	tlsConfig       *tls.Config
+	tlsConfig       *tls.Config // Server TLS config
+	clientTLSConfig *tls.Config // Client TLS config for connecting to backends
 	server          *http.Server
 	httpServer      *http.Server
 	mu              sync.RWMutex
@@ -91,31 +92,56 @@ type Proxy struct {
 
 // NewProxy creates a new proxy
 func NewProxy(serviceName string, caURL string, discoveryAddr string) (*Proxy, error) {
-	// Initialize CA client (simplified version - in reality HTTP client is needed)
-	// For demonstration, create local CA
-	// Use empty string for in-memory mode (proxy doesn't need persistence)
-	certAuthority, err := ca.NewCA("")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create CA: %w", err)
-	}
-
-	// Get TLS configuration
-	tlsConfig, err := certAuthority.GetTLSConfig(serviceName, true)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get TLS config: %w", err)
-	}
-
 	// Create balancer
 	lb := balancer.NewBalancer(balancer.StrategyRoundRobin)
-
-	// Start health checker
 	lb.StartHealthChecker(10 * time.Second)
 
+	var tlsConfig, clientTLSConfig *tls.Config
+	var certAuthority *ca.CA
+
+	// If CA URL is provided, use CA client to get certificates from CA server
+	if caURL != "" {
+		caClient := ca.NewClient(caURL)
+		
+		// Get server TLS configuration from CA server
+		var err error
+		tlsConfig, err = caClient.GetTLSConfig(serviceName, true)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get server TLS config from CA server: %w", err)
+		}
+		
+		// Get client TLS configuration from CA server
+		clientTLSConfig, err = caClient.GetTLSConfig(serviceName, false)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get client TLS config from CA server: %w", err)
+		}
+	} else {
+		// Fallback: create local CA (for backward compatibility or testing)
+		var err error
+		certAuthority, err = ca.NewCA("")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create local CA: %w", err)
+		}
+
+		// Get TLS configuration from local CA
+		tlsConfig, err = certAuthority.GetTLSConfig(serviceName, true)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get TLS config: %w", err)
+		}
+
+		// Get client TLS config for connecting to backends
+		clientTLSConfig, err = certAuthority.GetTLSConfig(serviceName, false)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get client TLS config: %w", err)
+		}
+	}
+
 	p := &Proxy{
-		serviceName: serviceName,
-		ca:          certAuthority,
-		balancer:    lb,
-		tlsConfig:   tlsConfig,
+		serviceName:     serviceName,
+		ca:              certAuthority, // nil if using CA server
+		balancer:        lb,
+		tlsConfig:       tlsConfig,     // Server TLS config
+		clientTLSConfig: clientTLSConfig, // Client TLS config for backends
 	}
 
 	// Initialize discovery client (if needed)
@@ -328,11 +354,17 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Wrap response writer to capture status code
 	wrapped := &proxyResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 	
-	// Only use TLS transport if target URL is HTTPS
+	// Always use TLS transport with client certificates for mTLS
+	// Backends should use HTTPS with mTLS
 	if targetURL.Scheme == "https" {
 		proxy.Transport = &http.Transport{
-			TLSClientConfig: p.tlsConfig,
+			TLSClientConfig: p.clientTLSConfig,
 		}
+	} else {
+		// If backend uses HTTP, log warning but continue
+		// In production, all backends should use HTTPS
+		log.Printf("Warning: Backend %s uses HTTP instead of HTTPS", backend.URL)
+		proxy.Transport = &http.Transport{}
 	}
 
 	// Update request
@@ -430,8 +462,8 @@ func (p *Proxy) handleUpdateBackends(w http.ResponseWriter, r *http.Request) {
 	}
 	urls := make([]string, 0, len(services))
 	for _, s := range services {
-		// Use HTTP for services (they run on HTTP, not HTTPS)
-		urls = append(urls, fmt.Sprintf("http://%s:%d", s.Address, s.Port))
+		// Use HTTPS for services with mTLS
+		urls = append(urls, fmt.Sprintf("https://%s:%d", s.Address, s.Port))
 	}
 
 	p.balancer.UpdateBackends(serviceName, urls)
@@ -537,8 +569,8 @@ func (p *Proxy) UpdateBackendsFromDiscovery() error {
 		for _, s := range services {
 			if s.Healthy {
 				healthyCount++
-				// Use HTTP for services (they run on HTTP, not HTTPS)
-				urls = append(urls, fmt.Sprintf("http://%s:%d", s.Address, s.Port))
+				// Use HTTPS for services with mTLS
+				urls = append(urls, fmt.Sprintf("https://%s:%d", s.Address, s.Port))
 			}
 		}
 		if len(urls) > 0 {
